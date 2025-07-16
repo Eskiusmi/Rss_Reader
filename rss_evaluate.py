@@ -1,4 +1,4 @@
-import json, os, re, time, random, requests, feedparser, http.client, difflib, hashlib
+import json, os, re, time, random, requests, feedparser, http.client, difflib, hashlib, csv
 from datetime import datetime, timedelta
 from dateutil import parser as date_parser
 http.client.IncompleteRead = lambda *args, **kwargs: args[0]
@@ -11,11 +11,19 @@ HEADERS = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "applicati
 HOURS_WINDOW = 24
 DB_FILE = "rss_db.json"
 DEDUP_CACHE_FILE = "dedup_cache.json"
+WHITELIST_FILE = "university_whitelist.csv"
 
 DIMENSION_ORDER = ["教育关联度", "热度与冲击力", "新颖性与视觉性", "延展性与深度", "受众匹配度"]
 WEIGHTS = [0.30, 0.25, 0.20, 0.15, 0.10]
 
 dedup_cache = json.load(open(DEDUP_CACHE_FILE, encoding="utf-8")) if os.path.exists(DEDUP_CACHE_FILE) else {}
+
+def load_whitelist():
+    if not os.path.exists(WHITELIST_FILE):
+        print("⚠️ 未找到名单文件 university_whitelist.csv，默认不过滤")
+        return None
+    with open(WHITELIST_FILE, encoding="utf-8") as f:
+        return set(row["university"].strip() for row in csv.DictReader(f))
 
 def make_prompt(title, summary):
     return f"""你是教育领域内容创作者的智能助手，请对以下新闻进行多维度评分和解释。
@@ -150,18 +158,44 @@ def save_dedup_cache():
 
 def collect(feeds="feeds.json"):
     now = datetime.utcnow().replace(tzinfo=None)
-    items=[]
+    whitelist = load_whitelist()
+    items = []
+
     for f in json.load(open(feeds, encoding="utf-8")):
         rss = f.get("rss")
-        if not rss: continue
+        if not rss:
+            continue
         parsed = fetch_rss(rss)
+        print(f"🧪 Feed: {rss}")
+        print(f"🧪 Entries found: {len(parsed.entries)}")
+
         for e in parsed.entries:
             title = e.get("title", "").strip()
             link = e.get("link", "").strip()
-            summary = e.get("summary", "") or e.get("content", [{}])[0].get("value", "")
+            summary = e.get("summary", "").strip()
+
+            # Google Alerts 有时将内容放在 content 字段
+            if not summary:
+                summary = e.get("content", [{}])[0].get("value", "").strip()
+
             published_raw = e.get("published", "") or e.get("updated", "") or e.get("created", "")
             pub_time = parse_datetime_safe(published_raw)
-            if now - pub_time > timedelta(hours=HOURS_WINDOW): continue
+
+            # fallback：Google Alerts 有些是没有时间字段的
+            if not published_raw:
+                pub_time = now
+
+            # 合并文本用于关键词匹配
+            text = f"{title} {summary}"
+            if whitelist and not any(uni.lower() in text.lower() for uni in whitelist):
+                print(f"⛔ 忽略：未命中关键词 → {title[:50]}")
+                continue
+
+            # 暂时放宽时间窗口限制（可选）
+            if now - pub_time > timedelta(hours=HOURS_WINDOW):
+                print(f"⏱️ 忽略：新闻过旧 → {title[:50]}")
+                continue
+
             items.append({
                 "university": f.get("university", "Google Alert"),
                 "title": title,
@@ -169,8 +203,10 @@ def collect(feeds="feeds.json"):
                 "summary": summary,
                 "published": pub_time.isoformat()
             })
+
     print(f"✅ 抓取完成，共收集新闻：{len(items)}")
     return items
+
 
 def main():
     today = deduplicate(collect())
